@@ -130,6 +130,11 @@ def _delegated_child(cache_scope_id):
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     model_metadata = MODEL_METADATA
+    # A per-account provider's account name (#441); None for the plugin's main provider.
+    account = None
+
+    def _account(self):
+        return {'account': self.account} if self.account else {}
 
     def get_model_context_length(self, model):
         route = native_model(model)
@@ -160,7 +165,7 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
                           label=format_cost_label(amount), notes=('native API list-price equivalent; not subscription invoice; extra usage unknown',))
 
     def create_client(self, **client_kwargs):
-        return _directsdk.Client(**client_kwargs)
+        return _directsdk.Client(**client_kwargs, **self._account())
 
     def fetch_models(self, **kwargs):
         # No HTTP /models endpoint: the account's own picker (CLI `initialize` handshake) is the
@@ -169,10 +174,10 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         return [row["id"] for row in rows] if rows else None
 
     def setup_status(self, **kwargs):
-        return _directsdk_setup.setup_status(**kwargs)
+        return _directsdk_setup.setup_status(**kwargs, **self._account())
 
     def discover_models(self, **kwargs):
-        return _directsdk_setup.discover_models(**kwargs)
+        return _directsdk_setup.discover_models(**kwargs, **self._account())
 
     def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
         extra = {'reasoning': dict(reasoning_config)} if reasoning_config else {}
@@ -191,7 +196,7 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
     def fetch_account_usage(self, *, base_url=None, api_key=None):
         """`/usage` plan limits, asked of Claude Code itself; every failure is an `Unavailable:` line, never a raise."""
         from agent.account_usage import AccountUsageSnapshot
-        limits, reason = _directsdk_setup.fetch_usage()
+        limits, reason = _directsdk_setup.fetch_usage(**self._account())
         windows, details = usage_windows(limits) if limits is not None else ((), ())
         return AccountUsageSnapshot(provider=self.name, source='claude_code_get_usage', fetched_at=datetime.now(timezone.utc),
                                     title='Claude plan limits', windows=tuple(windows), details=tuple(details),
@@ -229,40 +234,60 @@ def classify_api_error(error, **_):
             f'Enterprise, your workspace admin controls them). Upstream said: {str(error)[:400]}')
     # A request refused before Claude Code starts fails the same way on every retry; another provider may serve it.
     # Matched by class name: the plugin can load as a package or as top-level modules, so the class may be either copy.
-    if type(error).__name__ == 'RequestRejected':
+    # A per-account provider whose account this profile does not declare: the same on every retry.
+    if type(error).__name__ in ('RequestRejected', 'ClaudeAccountMissing'):
         return {'reason': 'format_error', 'retryable': False, 'should_fallback': True}
     return None
 
 
-profile = ClaudeOAuthDirectSDKProfile(
-    name='claude-subscription-directsdk-experimental',
-    display_name='Claude Subscription DirectSDK (Experimental)',
-    description='Claude Subscription DirectSDK (Experimental) (Claude Pro/Max subscription via your Claude Code login; Hermes owns tools)',
-    api_mode='chat_completions',
-    auth_type='external_process',
-    supports_health_check=False,
-    # Per-model only: the profile-wide supports_vision would also flip computer_use screenshots
-    # for unpinned ids to native, where the executor still treats them as text-only.
-    model_capabilities=MODEL_CAPABILITIES,
-    native_reasoning_details_type='claude-subscription-directsdk-experimental.native_assistant',
-    env_vars=(),
-    base_url='process://claude-subscription-directsdk-experimental',
-    process_command=_process_command,
-    process_args=(),
-    process_command_env_vars=('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND',),
-    default_aux_model='claude-sonnet-5[1m]',
-    # Access-gated models (Mythos) stay out: an account sees one only when its own picker offers it.
-    fallback_models=PICKER_ROUTES,
-    model_aliases={alias: native_model(alias) for alias in ALIASES},
-    # A dataclass field (Hermes >= 0.21.4), so a method on the subclass would be shadowed by its None default.
-    classify_api_error=classify_api_error,
-)
-# Attribute assignment keeps the plugin loadable on hosts predating this capability.
-# Newer hosts use it to avoid buffering a healthy native stream behind a stale-call timer.
-profile.supports_streaming = True
-# Schema-less json_object is refused (only json_schema maps to native structured output); Hermes drops it up front.
-profile.unsupported_response_formats = ('json_object',)
+PROVIDER_ID = 'claude-subscription-directsdk-experimental'
+
+
+def _make_profile(name=PROVIDER_ID, display_name='Claude Subscription DirectSDK (Experimental)', account=None):
+    made = ClaudeOAuthDirectSDKProfile(
+        name=name,
+        display_name=display_name,
+        description='Claude Subscription DirectSDK (Experimental) (Claude Pro/Max subscription via your Claude Code login; Hermes owns tools)'
+                    + (f' · account {account}' if account else ''),
+        api_mode='chat_completions',
+        auth_type='external_process',
+        supports_health_check=False,
+        # Per-model only: the profile-wide supports_vision would also flip computer_use screenshots
+        # for unpinned ids to native, where the executor still treats them as text-only.
+        model_capabilities=MODEL_CAPABILITIES,
+        # One carrier type for every account: a conversation replays its signed turns after a switch or failover.
+        native_reasoning_details_type='claude-subscription-directsdk-experimental.native_assistant',
+        env_vars=(),
+        base_url=f'process://{name}',
+        process_command=_process_command,
+        process_args=(),
+        process_command_env_vars=('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND',),
+        default_aux_model='claude-sonnet-5[1m]',
+        # Access-gated models (Mythos) stay out: an account sees one only when its own picker offers it.
+        fallback_models=PICKER_ROUTES,
+        model_aliases={alias: native_model(alias) for alias in ALIASES},
+        # A dataclass field (Hermes >= 0.21.4), so a method on the subclass would be shadowed by its None default.
+        classify_api_error=classify_api_error,
+    )
+    made.account = account
+    # Attribute assignment keeps the plugin loadable on hosts predating this capability.
+    # Newer hosts use it to avoid buffering a healthy native stream behind a stale-call timer.
+    made.supports_streaming = True
+    # Schema-less json_object is refused (only json_schema maps to native structured output); Hermes drops it up front.
+    made.unsupported_response_formats = ('json_object',)
+    return made
+
+
+profile = _make_profile()
 register_provider(profile)
+
+# One provider per declared account (#441): `<plugin id>-<name>`, shown as "Claude Subscription · <name>", each with
+# its own login, picker and /usage. Read from the profile Hermes loads the plugin for; a request re-reads the active
+# profile's accounts and refuses an account that profile does not declare.
+account_profiles = {}
+for _name in _directsdk_setup.accounts():
+    account_profiles[_name] = _make_profile(f'{PROVIDER_ID}-{_name}', f'Claude Subscription · {_name}', _name)
+    register_provider(account_profiles[_name])
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the
 # install hint; the request path (`directsdk.Client`) refuses with the same message.

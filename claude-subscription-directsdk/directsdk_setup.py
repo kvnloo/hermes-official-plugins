@@ -11,6 +11,7 @@ pinned catalog rather than failing setup.
 """
 import atexit
 import base64
+import contextvars
 import ipaddress
 import json
 import logging
@@ -24,6 +25,7 @@ import threading
 import time
 from collections import namedtuple
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -189,6 +191,94 @@ def telemetry_enabled():
     return isinstance(value, (bool, int)) and bool(value)
 
 
+ACCOUNTS_SETTING = "accounts"
+STRATEGY_SETTING = "strategy"
+STRATEGIES = ("ordered", "round-robin")
+# An account name becomes part of a provider id (`<plugin id>-<name>`), which core's pickers, CLI flags and
+# fallback_providers entries carry: lowercase letters, digits and hyphens only.
+_ACCOUNT_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_bad_accounts = set()
+
+
+def _warn_once(key, message, *args):
+    if key not in _bad_accounts:
+        _bad_accounts.add(key)
+        _logger.warning(message, *args)
+
+
+def accounts():
+    """The active profile's ``accounts`` setting as ``{name: config dir}`` in its declared order, ``~`` expanded.
+
+    Read on every call, like ``claude_config_dir``. An entry with an unusable name or an empty directory is
+    skipped and warned once; anything but a mapping means no accounts.
+    """
+    value = _setting(ACCOUNTS_SETTING)
+    if value is None or value == {} or value == "":
+        return {}
+    if not isinstance(value, Mapping):
+        _warn_once(("type", type(value).__name__), "claude-subscription-directsdk: %s must be a mapping of account name "
+                   "to Claude config directory (got %s); ignoring it", ACCOUNTS_SETTING, type(value).__name__)
+        return {}
+    found = {}
+    for name, directory in value.items():
+        if not isinstance(name, str) or not _ACCOUNT_NAME.match(name):
+            _warn_once(("name", repr(name)), "claude-subscription-directsdk: account name %r must be lowercase letters, "
+                       "digits and hyphens (at most 32); skipping it", name)
+        elif not isinstance(directory, str) or not directory.strip():
+            _warn_once(("dir", name), "claude-subscription-directsdk: account %r needs a Claude config directory; "
+                       "skipping it", name)
+        else:
+            found[name] = os.path.expanduser(directory.strip())
+    return found
+
+
+def strategy():
+    """The active profile's failover ``strategy``: ``ordered``, ``round-robin``, or ``None`` (off, the default)."""
+    value = _setting(STRATEGY_SETTING)
+    value = value.strip().lower().replace("_", "-") if isinstance(value, str) else value
+    if value in STRATEGIES:
+        return value
+    if value not in (None, "", "off", "none", False):
+        _warn_once(("strategy", repr(value)), "claude-subscription-directsdk: %s must be one of off, %s (got %r); "
+                   "failover stays off", STRATEGY_SETTING, ", ".join(STRATEGIES), value)
+    return None
+
+
+class ClaudeAccountMissing(RuntimeError):
+    """A per-account provider whose account is not in the active profile's ``accounts`` setting."""
+
+
+def account_dir(name):
+    """The active profile's config directory for account ``name``; refused when this profile does not declare it,
+    so a profile served by another profile's process never signs in with a login it did not name."""
+    found = accounts().get(name)
+    if found is None:
+        raise ClaudeAccountMissing(f"Claude account {name!r} is not in this profile's {ACCOUNTS_SETTING} plugin setting. "
+                                   f"Add it (plugins.entries.{PLUGIN_ID}.settings.{ACCOUNTS_SETTING}.{name}: <logged-in "
+                                   "Claude config directory>) or pick another provider.")
+    return found
+
+
+# The login a per-account provider or failover picked for the spawn being prepared (#441). Set only around the
+# synchronous env preparation (``with account_login(dir): apply_config_dir(env); apply_profile_credential(env)``),
+# where it takes the place of the claude_config_dir setting and drops any token.
+_account_login = contextvars.ContextVar("claude_directsdk_account_login", default=None)
+
+
+@contextmanager
+def account_login(directory):
+    token = _account_login.set(directory or None)
+    try:
+        yield
+    finally:
+        _account_login.reset(token)
+
+
+def _config_dir_setting():
+    """The directory this spawn selects: the picked account's, else the profile's ``claude_config_dir`` setting."""
+    return _account_login.get() or _setting(CONFIG_DIR_SETTING)
+
+
 MAX_CONCURRENT_SETTING = "max_concurrent"
 MAX_CONCURRENT_DEFAULT = 4
 _bad_limits = set()
@@ -211,7 +301,7 @@ def max_concurrent():
 def apply_config_dir(env):
     """Select the active profile's Claude config directory on a child env, in place."""
     override = env.pop("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR", None)
-    setting = _setting(CONFIG_DIR_SETTING)
+    setting = _config_dir_setting()
     config = (setting.strip() if isinstance(setting, str) else "") or override or env.get("CLAUDE_CONFIG_DIR")
     if config:
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config)
@@ -274,9 +364,10 @@ def apply_profile_credential(env):
             env[name] = value
         elif routed:
             env.pop(name, None)
-    setting = _setting(CONFIG_DIR_SETTING)
+    setting = _config_dir_setting()
     selected = setting.strip() if isinstance(setting, str) else ""
-    if selected and not (get_secret and _scoped(get_secret, OAUTH_TOKEN_ENV)):
+    # A selected account always beats a token: the account the user picked is the one billed (#441).
+    if selected and (_account_login.get() or not (get_secret and _scoped(get_secret, OAUTH_TOKEN_ENV))):
         env.pop(OAUTH_TOKEN_ENV, None)
     if routed and not selected:
         if get_secret is None:
@@ -305,12 +396,14 @@ def apply_traffic_policy(env, telemetry=None):
     return env
 
 
-def _child_env(env, *, flag_fetch=False):
+def _child_env(env, *, flag_fetch=False, account=None):
     """The env for a setup probe. ``flag_fetch`` lifts the quiet flags that block the CLI's feature-flag
-    and usage fetches (``FLAG_FETCH_BLOCKERS``), except one the user exported in ``env``."""
+    and usage fetches (``FLAG_FETCH_BLOCKERS``), except one the user exported in ``env``. ``account`` names a
+    per-account provider's account; its directory is the login."""
     child = drop_api_credentials(dict(env))
-    apply_config_dir(child)
-    apply_profile_credential(child)
+    with account_login(account_dir(account) if account else None):
+        apply_config_dir(child)
+        apply_profile_credential(child)
     reap_orphaned_refresh_lock(child)
     apply_traffic_policy(child)
     if flag_fetch:
@@ -421,17 +514,18 @@ def _plan_label(raw):
     return raw if raw.lower().startswith("claude") else "Claude " + raw.replace("_", " ").title()
 
 
-def setup_status(command=None, env=None, timeout=20):
-    """``{available, logged_in, plan, detail, login_command}`` from the CLI's own ``auth status``."""
+def setup_status(command=None, env=None, timeout=20, account=None):
+    """``{available, logged_in, plan, detail, login_command}`` from the CLI's own ``auth status`` (of ``account``'s
+    login for a per-account provider)."""
     env = dict(env if env is not None else os.environ)
     resolved = _resolve(command, env)
     if resolved is None:
         return {"available": False, "logged_in": False, "plan": "", "detail": INSTALL_HINT, "login_command": None}
     login_command = resolved + ["auth", "login"]
     try:
-        child = _child_env(env)
+        child = _child_env(env, account=account)
         resolve_upstream()  # an unusable gateway setting fails setup, and an opted-in one logs where the login goes
-    except (UnscopedSecretError, ClaudeCodeLoggedOut, ClaudeUpstreamConfigError) as error:
+    except (UnscopedSecretError, ClaudeCodeLoggedOut, ClaudeUpstreamConfigError, ClaudeAccountMissing) as error:
         return {"available": True, "logged_in": False, "plan": "", "detail": str(error), "login_command": login_command}
     try:
         run = subprocess.run(resolved + ["auth", "status"], env=child, stdin=subprocess.DEVNULL,
@@ -459,19 +553,19 @@ def _first_party(env):
             and all(str(env.get(key, "")).strip().lower() in (*_OFF, "") for key in BACKEND_SWITCHES))
 
 
-def discover_models(command=None, env=None, timeout=40):
+def discover_models(command=None, env=None, timeout=40, account=None):
     """The account's live picker as ``[{id, label, note, upstream_requests}]`` in Hermes route ids,
     or ``None`` when the CLI is missing, logged out, or the handshake fails."""
     env = dict(env if env is not None else os.environ)
     resolved = _resolve(command, env)
     # Logged out, the handshake still answers with a generic default list; only a signed-in
     # account's picker reflects its entitlements.
-    if resolved is None or not setup_status(command=resolved, env=env, timeout=timeout)["logged_in"]:
+    if resolved is None or not setup_status(command=resolved, env=env, timeout=timeout, account=account)["logged_in"]:
         return None
     try:
-        child = _child_env(env, flag_fetch=True)
+        child = _child_env(env, flag_fetch=True, account=account)
         upstream = resolve_upstream()
-    except (UnscopedSecretError, ClaudeCodeLoggedOut, ClaudeUpstreamConfigError):
+    except (UnscopedSecretError, ClaudeCodeLoggedOut, ClaudeUpstreamConfigError, ClaudeAccountMissing):
         return None
     # The account's own picker (entitlement-gated models such as Mythos, older models it still runs) is
     # native's served catalog, and native serves it only first-party: behind any ANTHROPIC_BASE_URL,
@@ -568,22 +662,23 @@ def discover_models(command=None, env=None, timeout=40):
     return list(routes.values())
 
 
-def fetch_usage(command=None, env=None, timeout=8):
+def fetch_usage(command=None, env=None, timeout=8, account=None):
     """``(rate_limits, None)`` from Claude Code's own ``get_usage`` control request, else ``(None, reason)``.
 
     The CLI fetches the plan limits with the login it already holds, so the plugin never reads or
     sends that token (catalog rule 11) and ``auth.adopt_external_logins: false`` keeps meaning what
     it says. It follows the same per-profile config dir as every native spawn, runs behind an unused
-    admission gate (zero inference), and fits under core's 10 s ``/usage`` hook deadline.
+    admission gate (zero inference), and fits under core's 10 s ``/usage`` hook deadline. ``account`` asks about
+    that per-account provider's login instead.
     """
     env = dict(env if env is not None else os.environ)
     resolved = _resolve(command, env)
     if resolved is None:
         return None, INSTALL_HINT
     try:
-        child = _child_env(env)
+        child = _child_env(env, account=account)
         upstream = resolve_upstream()
-    except (UnscopedSecretError, ClaudeCodeLoggedOut, ClaudeUpstreamConfigError) as error:
+    except (UnscopedSecretError, ClaudeCodeLoggedOut, ClaudeUpstreamConfigError, ClaudeAccountMissing) as error:
         return None, str(error)
     limits, reason = _ask_usage(resolved, child, env, upstream, timeout)
     if limits is not None:

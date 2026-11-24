@@ -27,19 +27,22 @@ import weakref
 from types import SimpleNamespace
 
 try:
-    from . import concurrency
+    from . import account_pool, concurrency
     from .model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
     from .process_tree import kill_process_tree, own_process_group, unreaped
     from .directsdk_setup import (
-        ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
+        ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, account_login, apply_config_dir,
+        apply_profile_credential,
         apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
 except ImportError:
+    import account_pool
     import concurrency
     from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
     from process_tree import kill_process_tree, own_process_group, unreaped
     from directsdk_setup import (
-        ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_profile_credential,
+        ClaudeCodeLoggedOut, INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, account_login, apply_config_dir,
+        apply_profile_credential,
         apply_traffic_policy, check_extra_usage, drop_api_credentials, egress_env, max_concurrent, observe_rate_limit,
         reap_orphaned_refresh_lock, relay, resolve_upstream, Upstream)
 
@@ -456,6 +459,8 @@ class Request:
         self.cancelled = threading.Event()
         self.admission = None
         self.lock = threading.Lock()
+        # The live per-account attempt while account failover serves this request (account_pool.serve).
+        self.attempt = None
 
     def cancel(self):
         self.cancelled.set()
@@ -464,6 +469,9 @@ class Request:
         with self.lock:
             if self.process is not None:
                 kill_process_tree(self.process)
+            attempt = self.attempt
+        if attempt is not None:
+            attempt.cancel()
 
     def spawn(self, command, *, stdin=subprocess.DEVNULL, **kwargs):
         with self.lock:
@@ -889,10 +897,12 @@ class Client:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, command=None, args=None, env=None, timeout=180, **_):
+    def __init__(self, command=None, args=None, env=None, timeout=180, account=None, **_):
         # Hermes snapshots routing metadata from client-shaped objects; this is not a credential.
         self.api_key = 'external-process'
-        self.base_url = 'process://claude-subscription-directsdk-experimental'
+        # A per-account provider's client runs every request on that account's login (#441).
+        self.account = account if isinstance(account, str) and account else None
+        self.base_url = 'process://claude-subscription-directsdk-experimental' + (f'-{self.account}' if self.account else '')
         self.env = dict(env) if env is not None else None
         source_env = self.env if self.env is not None else os.environ
         command = command or source_env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND') or 'claude'
@@ -961,11 +971,14 @@ class Client:
             system, frames = prepare_history(kwargs.get('messages', []), names)
             if not isinstance(kwargs.get('model'), str) or not kwargs['model']:
                 raise RequestRejected('model is required')
+            # Which login(s) serve it: None is the profile's single login, as before accounts existed.
+            rows = account_pool.plan(self.account)
         except BaseException:
             with self._lock:
                 self._requests.discard(request)
             raise
-        stream = Stream(self._run(request, kwargs, body, manifest, names, system, frames), request)
+        prepared = (kwargs, body, manifest, names, system, frames)
+        stream = Stream(self._run(request, *prepared) if rows is None else self._serve(request, rows, prepared), request)
         if kwargs.get('stream'):
             return stream
         try:
@@ -976,7 +989,16 @@ class Client:
         finally:
             stream.close()
 
-    def _run(self, request, kwargs, body, manifest, names, system, frames):
+    def _serve(self, request, rows, prepared):
+        """Run the request on ``rows``' accounts with plan-limit failover; each attempt has its own handle."""
+        try:
+            yield from account_pool.serve(request, lambda: Request(self), rows,
+                                          lambda attempt, directory: self._run(attempt, *prepared, account_dir=directory))
+        finally:
+            with self._lock:
+                self._requests.discard(request)
+
+    def _run(self, request, kwargs, body, manifest, names, system, frames, account_dir=None):
         hermes_names = {native: hermes for hermes, native in names.items()}
         p = None
         reader = None
@@ -1012,10 +1034,11 @@ class Client:
                 resolved = resolve_claude(self.command, env)
                 if resolved is None:
                     raise ClaudeCodeMissing(INSTALL_HINT)
-                apply_config_dir(env)
-                if self.env is None:
-                    # The serving profile's own token, or none when its claude_config_dir picks the login.
-                    apply_profile_credential(env)
+                with account_login(account_dir):
+                    apply_config_dir(env)
+                    if self.env is None:
+                        # The serving profile's own token, or none when its claude_config_dir (or account) picks the login.
+                        apply_profile_credential(env)
                 # A refresh lock an earlier native left mid-refresh would fail this request (claude-code#95236).
                 reap_orphaned_refresh_lock(env)
                 # Anthropic or the profile's opted-in gateway; an explicit Client(env=...) fixture may name its own.

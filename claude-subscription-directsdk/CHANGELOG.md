@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0] - Unreleased
+
+### Added
+
+- Several Claude logins in one profile (#441, thanks @oldhandben). The `accounts` setting maps names to logged-in Claude config directories; each one registers its own provider, `claude-subscription-directsdk-experimental-<name>` ("Claude Subscription · <name>"), with its own picker and `/usage`, so a second subscription no longer needs a renamed copy of the plugin. `claude_config_dir` keeps working as the single-account form. The optional `strategy` (`ordered`, `round-robin`) lets the main provider move a request to the next account when Claude reports a used-up plan window, and skips that account until the reset it named; other errors never switch. Without `accounts`, nothing changes.
+
 ## [0.4.0] - Unreleased
 
 ### Added

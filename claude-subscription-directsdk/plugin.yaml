@@ -1,6 +1,6 @@
 name: claude-subscription-directsdk-experimental
 kind: model-provider
-version: 0.4.0
+version: 0.5.0
 manifest_version: 2
 description: Claude Subscription DirectSDK (Experimental) — drive your Claude Pro/Max subscription through the official Claude Code CLI; Hermes owns tools, approvals and compaction
 author: Nous Research
@@ -92,3 +92,24 @@ config_schema:
     description: >-
       A PEM file added to the system roots, for a TLS-inspecting proxy or a gateway with a private CA.
       Certificate and hostname checks stay on. An unreadable file refuses every request.
+  accounts:
+    type: dict
+    default: {}
+    label: Claude accounts (one provider each)
+    description: >-
+      Several Claude logins in one profile, as account name -> logged-in Claude config directory (for example
+      main: ~/.claude, work: ~/.claude-work). Each account is its own provider,
+      claude-subscription-directsdk-experimental-<name>, shown as "Claude Subscription · <name>", with its own
+      model picker and /usage. Names are lowercase letters, digits and hyphens. New accounts appear after a
+      Hermes restart. claude_config_dir stays the single-account form.
+  strategy:
+    type: string
+    default: "off"
+    choices: ["off", ordered, round-robin]
+    label: Switch accounts at a plan limit
+    description: >-
+      With two or more accounts, the main provider runs each request on one of them and moves to the next when
+      Claude says the account's plan window is used up, skipping that account until the window reopens.
+      ordered: always start with the first account (keeps a conversation's prompt cache on one account).
+      round-robin: start with the next account on each request (each account caches separately).
+      off: the main provider keeps using claude_config_dir or the default login. Other errors never switch.
